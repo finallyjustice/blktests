@@ -1,0 +1,90 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2018 Ming Lei
+#
+# Regression test for patch "blkcg: handle dying request_queue when associating
+# a blkg"
+#
+# This tries to expose the race condition between blkg association and
+# request_queue shutdown. When a request_queue is shutdown, the corresponding
+# blkgs are destroyed. Any further associations should fail gracefully and not
+# cause a kernel panic.
+
+. tests/block/rc
+. common/scsi_debug
+. common/cgroup
+
+DESCRIPTION="test graceful shutdown of scsi_debug devices with running fio jobs"
+QUICK=1
+
+requires() {
+	_have_cgroup2_controller io && _have_scsi_debug && _have_fio
+}
+
+scsi_debug_stress_remove() {
+	scsi_debug_path="/sys/bus/pseudo/drivers/scsi_debug"
+	count=21
+
+	runtime=12
+	nr_fio_jobs=8
+	scsi_dbg_ndelay=10000
+
+	# set higher aio limit
+	echo 524288 > /proc/sys/fs/aio-max-nr
+
+	#figure out the CAN_QUEUE
+	can_queue=$(((count + 1) * (count / 2) / 2))
+
+	rmmod scsi_debug > /dev/null 2>&1
+	modprobe scsi_debug virtual_gb=128 max_luns=$count \
+		ndelay=$scsi_dbg_ndelay max_queue=$can_queue
+
+	# figure out scsi_debug disks
+	hosts=$(ls -d /sys/bus/pseudo/drivers/scsi_debug/adapter0/host*)
+	hostname=$(basename "$hosts")
+	host=$(echo "$hostname" | grep -o -E '[0-9]+')
+
+	sdisks=$(ls -d $scsi_debug_path/adapter*/"$hostname"/target*/*/block/*)
+	disks=""
+	for sd in $sdisks; do
+		disks+="/dev/"$(basename "$sd")
+		disks+=" "
+	done
+
+	fio_jobs=""
+	cnt=0
+	for sd in $disks; do
+		cnt=$((cnt+1))
+		fio_jobs=$fio_jobs" --name=job1 --filename=$sd: "
+		dev_name=$(basename "$sd")
+		q_path=/sys/block/$dev_name/queue
+
+		scheds=($(sed 's/[][]//g' "$q_path/scheduler"))
+		sched_idx=$((cnt % ${#scheds[@]}))
+		echo "${scheds[$sched_idx]}" > "$q_path/scheduler"
+		echo $cnt > "$q_path/../device/queue_depth"
+	done
+
+	fio --rw=randread --size=128G --direct=1 --ioengine=libaio \
+		--iodepth=2048 --numjobs=$nr_fio_jobs --bs=4k \
+		--group_reporting=1 --group_reporting=1 --runtime=$runtime \
+		--loops=10000 "$fio_jobs" > "$FULL" 2>&1 &
+
+	sleep 7
+	for sd in $disks; do
+		dev_name=$(basename "$sd")
+		dpath=/sys/block/$dev_name/device
+		[ -f "$dpath/delete" ] && echo 1 > "$dpath/delete"
+	done
+
+	wait
+}
+
+
+test() {
+	echo "Running ${TEST_NAME}"
+
+	scsi_debug_stress_remove
+
+	echo "Test complete"
+}
